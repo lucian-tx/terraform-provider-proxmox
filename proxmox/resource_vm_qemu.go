@@ -2,18 +2,22 @@ package proxmox
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net"
+	"net/url"
 	"path"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/hashicorp/go-cty/cty"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/customdiff"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
 	pxapi "github.com/lucian-tx/proxmox-api-go/proxmox"
@@ -26,13 +30,33 @@ var thisResource *schema.Resource
 
 func resourceVmQemu() *schema.Resource {
 	thisResource = &schema.Resource{
-		Create:        resourceVmQemuCreate,
-		Read:          resourceVmQemuRead,
+		CreateContext: resourceVmQemuCreate,
+		ReadContext:   resourceVmQemuRead,
 		UpdateContext: resourceVmQemuUpdate,
-		Delete:        resourceVmQemuDelete,
+		DeleteContext: resourceVmQemuDelete,
 		Importer: &schema.ResourceImporter{
 			StateContext: schema.ImportStatePassthroughContext,
 		},
+		CustomizeDiff: customdiff.All(
+			customdiff.ComputedIf(
+				"ssh_host",
+				func(ctx context.Context, d *schema.ResourceDiff, meta interface{}) bool {
+					return d.HasChange("vm_state")
+				},
+			),
+			customdiff.ComputedIf(
+				"default_ipv4_address",
+				func(ctx context.Context, d *schema.ResourceDiff, meta interface{}) bool {
+					return d.HasChange("vm_state")
+				},
+			),
+			customdiff.ComputedIf(
+				"ssh_port",
+				func(ctx context.Context, d *schema.ResourceDiff, meta interface{}) bool {
+					return d.HasChange("vm_state")
+				},
+			),
+		),
 
 		Schema: map[string]*schema.Schema{
 			"vmid": {
@@ -70,6 +94,14 @@ func resourceVmQemu() *schema.Resource {
 				Description:      "The VM bios, it can be seabios or ovmf",
 				ValidateDiagFunc: BIOSValidator(),
 			},
+			"vm_state": {
+				Type:             schema.TypeString,
+				Optional:         true,
+				Default:          "running",
+				Description:      "The state of the VM (running or stopped)",
+				ConflictsWith:    []string{"oncreate"},
+				ValidateDiagFunc: VMStateValidator(),
+			},
 			"onboot": {
 				Type:        schema.TypeBool,
 				Optional:    true,
@@ -83,10 +115,11 @@ func resourceVmQemu() *schema.Resource {
 				Description: "Startup order of the VM",
 			},
 			"oncreate": {
-				Type:        schema.TypeBool,
-				Optional:    true,
-				Default:     true,
-				Description: "VM autostart on create",
+				Type:          schema.TypeBool,
+				Optional:      true,
+				Default:       false,
+				Deprecated:    "Use `vm_state` instead",
+				ConflictsWith: []string{"vm_state"},
 			},
 			"tablet": {
 				Type:        schema.TypeBool,
@@ -296,6 +329,44 @@ func resourceVmQemu() *schema.Resource {
 							Type:     schema.TypeBool,
 							Optional: true,
 							Default:  false,
+						},
+					},
+				},
+			},
+			"smbios": {
+				Type:     schema.TypeList,
+				Optional: true,
+				Computed: true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"family": {
+							Type:     schema.TypeString,
+							Optional: true,
+						},
+						"manufacturer": {
+							Type:     schema.TypeString,
+							Optional: true,
+						},
+						"product": {
+							Type:     schema.TypeString,
+							Optional: true,
+						},
+						"serial": {
+							Type:     schema.TypeString,
+							Optional: true,
+						},
+						"sku": {
+							Type:     schema.TypeString,
+							Optional: true,
+						},
+						"uuid": {
+							Type:     schema.TypeString,
+							Optional: true,
+							Computed: true,
+						},
+						"version": {
+							Type:     schema.TypeString,
+							Optional: true,
 						},
 					},
 				},
@@ -827,7 +898,7 @@ func resourceVmQemu() *schema.Resource {
 	return thisResource
 }
 
-func resourceVmQemuCreate(d *schema.ResourceData, meta interface{}) error {
+func resourceVmQemuCreate(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
 	// create a logger for this function
 	logger, _ := CreateSubLogger("resource_vm_create")
 
@@ -898,6 +969,7 @@ func resourceVmQemuCreate(d *schema.ResourceData, meta interface{}) error {
 		QemuSerials:    qemuSerials,
 		QemuPCIDevices: qemuPCIDevices,
 		QemuUsbs:       qemuUsbs,
+		Smbios1:        BuildSmbiosArgs(d.Get("smbios").([]interface{})),
 		// Cloud-init.
 		CIuser:       d.Get("ciuser").(string),
 		CIpassword:   d.Get("cipassword").(string),
@@ -925,9 +997,9 @@ func resourceVmQemuCreate(d *schema.ResourceData, meta interface{}) error {
 	pool := d.Get("pool").(string)
 
 	if dupVmr != nil && forceCreate {
-		return fmt.Errorf("duplicate VM name (%s) with vmId: %d. Set force_create=false to recycle", vmName, dupVmr.VmId())
+		return diag.FromErr(fmt.Errorf("duplicate VM name (%s) with vmId: %d. Set force_create=false to recycle", vmName, dupVmr.VmId()))
 	} else if dupVmr != nil && dupVmr.Node() != targetNode {
-		return fmt.Errorf("duplicate VM name (%s) with vmId: %d on different target_node=%s", vmName, dupVmr.VmId(), dupVmr.Node())
+		return diag.FromErr(fmt.Errorf("duplicate VM name (%s) with vmId: %d on different target_node=%s", vmName, dupVmr.VmId(), dupVmr.Node()))
 	}
 
 	vmr := dupVmr
@@ -940,7 +1012,7 @@ func resourceVmQemuCreate(d *schema.ResourceData, meta interface{}) error {
 			nextid = vmID
 		} else {
 			if err != nil {
-				return err
+				return diag.FromErr(err)
 			}
 		}
 
@@ -960,7 +1032,7 @@ func resourceVmQemuCreate(d *schema.ResourceData, meta interface{}) error {
 
 			sourceVmrs, err := client.GetVmRefsByName(d.Get("clone").(string))
 			if err != nil {
-				return err
+				return diag.FromErr(err)
 			}
 
 			// prefer source Vm located on same node
@@ -975,14 +1047,14 @@ func resourceVmQemuCreate(d *schema.ResourceData, meta interface{}) error {
 			logger.Debug().Str("vmid", d.Id()).Msgf("Cloning VM")
 			err = config.CloneVm(sourceVmr, vmr, client)
 			if err != nil {
-				return err
+				return diag.FromErr(err)
 			}
 			// give sometime to proxmox to catchup
 			time.Sleep(time.Duration(d.Get("clone_wait").(int)) * time.Second)
 
 			config_post_clone, err := pxapi.NewConfigQemuFromApi(vmr, client)
 			if err != nil {
-				return err
+				return diag.FromErr(err)
 			}
 
 			logger.Debug().Str("vmid", d.Id()).Msgf("Original disks: '%+v', Clone Disks '%+v'", config.QemuDisks, config_post_clone.QemuDisks)
@@ -1007,20 +1079,20 @@ func resourceVmQemuCreate(d *schema.ResourceData, meta interface{}) error {
 			if err != nil {
 				// Set the id because when update config fail the vm is still created
 				d.SetId(resourceId(targetNode, "qemu", vmr.VmId()))
-				return err
+				return diag.FromErr(err)
 			}
 
 			err = prepareDiskSize(client, vmr, qemuDisks, d)
 			if err != nil {
 				d.SetId(resourceId(targetNode, "qemu", vmr.VmId()))
-				return err
+				return diag.FromErr(err)
 			}
 
 		} else if d.Get("iso").(string) != "" {
 			config.QemuIso = d.Get("iso").(string)
 			err := config.CreateVm(vmr, client)
 			if err != nil {
-				return err
+				return diag.FromErr(err)
 			}
 		} else if d.Get("pxe").(bool) {
 			var found bool
@@ -1031,7 +1103,7 @@ func resourceVmQemuCreate(d *schema.ResourceData, meta interface{}) error {
 			for _, reg := range regs {
 				re, err := regexp.Compile(reg)
 				if err != nil {
-					return err
+					return diag.FromErr(err)
 				}
 
 				found = re.MatchString(bs)
@@ -1042,15 +1114,15 @@ func resourceVmQemuCreate(d *schema.ResourceData, meta interface{}) error {
 			}
 
 			if !found {
-				return fmt.Errorf("no network boot option matched in 'boot' config")
+				return diag.FromErr(fmt.Errorf("no network boot option matched in 'boot' config"))
 			}
 
 			err := config.CreateVm(vmr, client)
 			if err != nil {
-				return err
+				return diag.FromErr(err)
 			}
 		} else {
-			return fmt.Errorf("either 'clone', 'iso', or 'pxe' must be set")
+			return diag.FromErr(fmt.Errorf("either 'clone', 'iso', or 'pxe' must be set"))
 		}
 	} else {
 		log.Printf("[DEBUG][QemuVmCreate] recycling VM vmId: %d", vmr.VmId())
@@ -1061,7 +1133,7 @@ func resourceVmQemuCreate(d *schema.ResourceData, meta interface{}) error {
 		if err != nil {
 			// Set the id because when update config fail the vm is still created
 			d.SetId(resourceId(targetNode, "qemu", vmr.VmId()))
-			return err
+			return diag.FromErr(err)
 		}
 
 		// give sometime to proxmox to catchup
@@ -1069,7 +1141,7 @@ func resourceVmQemuCreate(d *schema.ResourceData, meta interface{}) error {
 
 		err = prepareDiskSize(client, vmr, qemuDisks, d)
 		if err != nil {
-			return err
+			return diag.FromErr(err)
 		}
 	}
 	d.SetId(resourceId(targetNode, "qemu", vmr.VmId()))
@@ -1082,37 +1154,34 @@ func resourceVmQemuCreate(d *schema.ResourceData, meta interface{}) error {
 
 		_, err := client.SetVmConfig(vmr, vmParams)
 		if err != nil {
-			return err
+			return diag.FromErr(err)
 		}
 	}
 
 	// give sometime to proxmox to catchup
 	time.Sleep(time.Duration(d.Get("additional_wait").(int)) * time.Second)
 
-	if d.Get("oncreate").(bool) {
+	// TODO: remove "oncreate" handling in next major release.
+	if d.Get("vm_state").(string) == "running" || d.Get("oncreate").(bool) {
 		log.Print("[DEBUG][QemuVmCreate] starting VM")
 		_, err := client.StartVm(vmr)
 		if err != nil {
-			return err
+			return diag.FromErr(err)
 		}
-		// give sometime to proxmox to catchup
+		// // give sometime to proxmox to catchup
 		// time.Sleep(time.Duration(d.Get("additional_wait").(int)) * time.Second)
 
 		// err = initConnInfo(d, pconf, client, vmr, &config, lock)
 		// if err != nil {
-		// 	return err
+		// 	return diag.FromErr(err)
 		// }
 	} else {
-		log.Print("[DEBUG][QemuVmCreate] oncreate = false, not starting VM")
+		log.Print("[DEBUG][QemuVmCreate] vm_state != running, not starting VM")
 	}
 
-	// err := initConnInfo(d, pconf, client, vmr, &config, lock)
-	// if err != nil {
-	// 	return err
-	// }
 	log.Print("[DEBUG][QemuVmCreate] vm creation done!")
 	lock.unlock()
-	return resourceVmQemuRead(d, meta)
+	return resourceVmQemuRead(ctx, d, meta)
 }
 
 func resourceVmQemuUpdate(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
@@ -1221,6 +1290,7 @@ func resourceVmQemuUpdate(ctx context.Context, d *schema.ResourceData, meta inte
 		QemuSerials:    qemuSerials,
 		QemuPCIDevices: qemuPCIDevices,
 		QemuUsbs:       qemuUsbs,
+		Smbios1:        BuildSmbiosArgs(d.Get("smbios").([]interface{})),
 		// Cloud-init.
 		CIuser:       d.Get("ciuser").(string),
 		CIpassword:   d.Get("cipassword").(string),
@@ -1283,11 +1353,6 @@ func resourceVmQemuUpdate(ctx context.Context, d *schema.ResourceData, meta inte
 		}
 	}
 
-	err = initConnInfo(d, pconf, client, vmr, &config, lock)
-	if err != nil {
-		return diag.FromErr(err)
-	}
-
 	// If any of the "critical" keys are changed then a reboot is required.
 	if d.HasChanges(
 		"bios",
@@ -1329,6 +1394,7 @@ func resourceVmQemuUpdate(ctx context.Context, d *schema.ResourceData, meta inte
 		"serial",
 		"usb",
 		"hostpci",
+		"smbios",
 	) {
 		d.Set("reboot_required", true)
 	}
@@ -1417,12 +1483,10 @@ func resourceVmQemuUpdate(ctx context.Context, d *schema.ResourceData, meta inte
 	// Try rebooting the VM is a reboot is required and automatic_reboot is
 	// enabled. Attempt a graceful shutdown or if that fails, force poweroff.
 	vmState, err := client.GetVmState(vmr)
-	if err == nil && vmState["status"] != "stopped" && d.Get("reboot_required").(bool) {
+	if err == nil && vmState["status"] != "stopped" && d.Get("vm_state").(string) == "stopped" {
 		if d.Get("automatic_reboot").(bool) {
-			log.Print("[DEBUG][QemuVmUpdate] rebooting the VM to match the configuration changes")
-			_, err = client.RebootVm(vmr)
-			// note: the default timeout is 3 min, configurable per VM: Options/Start-Shutdown Order/Shutdown timeout
-			if err != nil {
+			log.Print("[DEBUG][QemuVmUpdate] rebooting the VM to match `vm_state`")
+			if _, err := client.RebootVm(vmr); err != nil {
 				log.Print("[DEBUG][QemuVmUpdate] reboot failed, stopping VM forcefully")
 
 				if _, err := client.StopVm(vmr); err != nil {
@@ -1438,6 +1502,19 @@ func resourceVmQemuUpdate(ctx context.Context, d *schema.ResourceData, meta inte
 					return diag.FromErr(err)
 				}
 			}
+		}
+	} else if err == nil && vmState["status"] != "stopped" && d.Get("reboot_required").(bool) {
+		if d.Get("automatic_reboot").(bool) {
+			log.Print("[DEBUG][QemuVmUpdate] shutting down VM for required reboot")
+			_, err = client.ShutdownVm(vmr)
+			// note: the default timeout is 3 min, configurable per VM: Options/Start-Shutdown Order/Shutdown timeout
+			if err != nil {
+				log.Print("[DEBUG][QemuVmUpdate] shutdown failed, stopping VM forcefully")
+				_, err = client.StopVm(vmr)
+				if err != nil {
+					return diag.FromErr(err)
+				}
+			}
 		} else {
 			// Automatic reboots is not enabled, show the user a warning message that
 			// the VM needs a reboot for the changed parameters to take in effect.
@@ -1448,13 +1525,7 @@ func resourceVmQemuUpdate(ctx context.Context, d *schema.ResourceData, meta inte
 				AttributePath: cty.Path{},
 			})
 		}
-	} else if err != nil {
-		return diag.FromErr(err)
-	}
-
-	// Start VM only if it wasn't running.
-	vmState, err = client.GetVmState(vmr)
-	if err == nil && vmState["status"] == "stopped" {
+	} else if err == nil && vmState["status"] == "stopped" && d.Get("vm_state").(string) == "running" {
 		log.Print("[DEBUG][QemuVmUpdate] starting VM")
 		_, err = client.StartVm(vmr)
 		if err != nil {
@@ -1464,33 +1535,35 @@ func resourceVmQemuUpdate(ctx context.Context, d *schema.ResourceData, meta inte
 		diags = append(diags, diag.FromErr(err)...)
 		return diags
 	}
+
+	// if vmState["status"] == "running" && d.Get("vm_state").(string) == "running" {
+	// 	diags = append(diags, initConnInfo(ctx, d, pconf, client, vmr, &config, lock)...)
+	// }
 	lock.unlock()
 
-	err = resourceVmQemuRead(d, meta)
-	if err != nil {
-		diags = append(diags, diag.FromErr(err)...)
-		return diags
-	}
-
+	// err = resourceVmQemuRead(ctx, d, meta)
+	// if err != nil {
+	// 	diags = append(diags, diag.FromErr(err)...)
+	// 	return diags
+	// }
+	diags = append(diags, resourceVmQemuRead(ctx, d, meta)...)
 	return diags
+	// return resourceVmQemuRead(ctx, d, meta)
 }
 
-func resourceVmQemuRead(d *schema.ResourceData, meta interface{}) error {
-	return _resourceVmQemuRead(d, meta)
-}
-
-func _resourceVmQemuRead(d *schema.ResourceData, meta interface{}) error {
+func resourceVmQemuRead(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
 	pconf := meta.(*providerConfiguration)
 	lock := pmParallelBegin(pconf)
 	defer lock.unlock()
 	client := pconf.Client
 	// create a logger for this function
+	var diags diag.Diagnostics
 	logger, _ := CreateSubLogger("resource_vm_read")
 
 	_, _, vmID, err := parseResourceId(d.Id())
 	if err != nil {
 		d.SetId("")
-		return fmt.Errorf("unexpected error when trying to read and parse the resource: %v", err)
+		return diag.FromErr(fmt.Errorf("unexpected error when trying to read and parse the resource: %v", err))
 	}
 
 	logger.Info().Int("vmid", vmID).Msg("Reading configuration for vmid")
@@ -1507,20 +1580,28 @@ func _resourceVmQemuRead(d *schema.ResourceData, meta interface{}) error {
 	}
 	config, err := pxapi.NewConfigQemuFromApi(vmr, client)
 	if err != nil {
-		return err
+		return diag.FromErr(err)
 	}
 
 	vmState, err := client.GetVmState(vmr)
 	log.Printf("[DEBUG] VM status: %s", vmState["status"])
-	if err == nil && vmState["status"] == "started" {
+	if err == nil {
+		d.Set("vm_state", vmState["status"])
+	}
+	if err == nil && vmState["status"] == "running" {
 		log.Printf("[DEBUG] VM is running, cheking the IP")
-		err = initConnInfo(d, pconf, client, vmr, config, lock)
-		if err != nil {
-			return err
-		}
+		diags = append(diags, initConnInfo(ctx, d, pconf, client, vmr, config, lock)...)
+	} else {
+		// Optional convience attributes for provisioners
+		err = d.Set("default_ipv4_address", nil)
+		diags = append(diags, diag.FromErr(err)...)
+		err = d.Set("ssh_host", nil)
+		diags = append(diags, diag.FromErr(err)...)
+		err = d.Set("ssh_port", nil)
+		diags = append(diags, diag.FromErr(err)...)
 	}
 	if err != nil {
-		return err
+		return diag.FromErr(err)
 	}
 
 	logger.Debug().Int("vmid", vmID).Msgf("[READ] Received Config from Proxmox API: %+v", config)
@@ -1578,7 +1659,10 @@ func _resourceVmQemuRead(d *schema.ResourceData, meta interface{}) error {
 	d.Set("ipconfig14", config.Ipconfig[14])
 	d.Set("ipconfig15", config.Ipconfig[15])
 
+	d.Set("smbios", ReadSmbiosArgs(config.Smbios1))
+
 	// Some dirty hacks to populate undefined keys with default values.
+	// TODO: remove "oncreate" handling in next major release.
 	checkedKeys := []string{"force_create", "define_connection_info", "oncreate"}
 	for _, key := range checkedKeys {
 		if val := d.Get(key); val == nil {
@@ -1603,7 +1687,7 @@ func _resourceVmQemuRead(d *schema.ResourceData, meta interface{}) error {
 					continue
 				}
 				if !pconf.DangerouslyIgnoreUnknownAttributes {
-					return fmt.Errorf("proxmox Provider Error: proxmox API returned new disk parameter '%v' we cannot process", key)
+					return diag.FromErr(fmt.Errorf("proxmox Provider Error: proxmox API returned new disk parameter '%v' we cannot process", key))
 				}
 			}
 		}
@@ -1635,28 +1719,28 @@ func _resourceVmQemuRead(d *schema.ResourceData, meta interface{}) error {
 	flatDisks, _ := FlattenDevicesList(config.QemuDisks)
 	flatDisks, _ = DropElementsFromMap([]string{"id"}, flatDisks)
 	if d.Set("disk", flatDisks); err != nil {
-		return err
+		return diag.FromErr(err)
 	}
 
 	// read in the qemu hostpci
 	qemuPCIDevices, _ := FlattenDevicesList(config.QemuPCIDevices)
 	logger.Debug().Int("vmid", vmID).Msgf("Hostpci Block Processed '%v'", config.QemuPCIDevices)
 	if d.Set("hostpci", qemuPCIDevices); err != nil {
-		return err
+		return diag.FromErr(err)
 	}
 
 	// read in the qemu hostpci
 	qemuUsbsDevices, _ := FlattenDevicesList(config.QemuUsbs)
 	logger.Debug().Int("vmid", vmID).Msgf("Usb Block Processed '%v'", config.QemuUsbs)
 	if d.Set("usb", qemuUsbsDevices); err != nil {
-		return err
+		return diag.FromErr(err)
 	}
 
 	// read in the unused disks
 	flatUnusedDisks, _ := FlattenDevicesList(config.QemuUnusedDisks)
 	logger.Debug().Int("vmid", vmID).Msgf("Unused Disk Block Processed '%v'", config.QemuUnusedDisks)
 	if d.Set("unused_disk", flatUnusedDisks); err != nil {
-		return err
+		return diag.FromErr(err)
 	}
 
 	// Display.
@@ -1680,7 +1764,7 @@ func _resourceVmQemuRead(d *schema.ResourceData, meta interface{}) error {
 				if key == "id" { // we purposely ignore id here as that is implied by the order in the TypeList/QemuDevice(list)
 					continue
 				}
-				return fmt.Errorf("proxmox Provider Error: proxmox API returned new network parameter '%v' we cannot process", key)
+				return diag.FromErr(fmt.Errorf("proxmox Provider Error: proxmox API returned new network parameter '%v' we cannot process", key))
 			}
 		}
 	}
@@ -1689,7 +1773,7 @@ func _resourceVmQemuRead(d *schema.ResourceData, meta interface{}) error {
 	flatNetworks, _ := FlattenDevicesList(config.QemuNetworks)
 	flatNetworks, _ = DropElementsFromMap([]string{"id"}, flatNetworks)
 	if err = d.Set("network", flatNetworks); err != nil {
-		return err
+		return diag.FromErr(err)
 	}
 
 	d.Set("pool", vmr.Pool())
@@ -1724,10 +1808,10 @@ func _resourceVmQemuRead(d *schema.ResourceData, meta interface{}) error {
 	}
 	logger.Debug().Int("vmid", vmID).Msgf("Finished VM read resulting in data: '%+v'", string(jsonString))
 
-	return nil
+	return diags
 }
 
-func resourceVmQemuDelete(d *schema.ResourceData, meta interface{}) error {
+func resourceVmQemuDelete(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
 	pconf := meta.(*providerConfiguration)
 	lock := pmParallelBegin(pconf)
 	defer lock.unlock()
@@ -1735,28 +1819,34 @@ func resourceVmQemuDelete(d *schema.ResourceData, meta interface{}) error {
 	client := pconf.Client
 	vmId, _ := strconv.Atoi(path.Base(d.Id()))
 	vmr := pxapi.NewVmRef(vmId)
-	_, err := client.StopVm(vmr)
+	vmState, err := client.GetVmState(vmr)
 	if err != nil {
-		return err
+		return diag.FromErr(err)
 	}
-
-	// Wait until vm is stopped. Otherwise, deletion will fail.
-	// ugly way to wait 5 minutes(300s)
-	waited := 0
-	for waited < 300 {
-		vmState, err := client.GetVmState(vmr)
-		if err == nil && vmState["status"] == "stopped" {
-			break
-		} else if err != nil {
-			return err
+	if vmState["status"] != "stopped" {
+		_, err := client.StopVm(vmr)
+		if err != nil {
+			return diag.FromErr(err)
 		}
-		// wait before next try
-		time.Sleep(5 * time.Second)
-		waited += 5
+
+		// Wait until vm is stopped. Otherwise, deletion will fail.
+		// ugly way to wait 5 minutes(300s)
+		waited := 0
+		for waited < 300 {
+			vmState, err := client.GetVmState(vmr)
+			if err == nil && vmState["status"] == "stopped" {
+				break
+			} else if err != nil {
+				return diag.FromErr(err)
+			}
+			// wait before next try
+			time.Sleep(5 * time.Second)
+			waited += 5
+		}
 	}
 
 	_, err = client.DeleteVm(vmr)
-	return err
+	return diag.FromErr(err)
 }
 
 // Increase disk size if original disk was smaller than new disk.
@@ -1773,6 +1863,9 @@ func prepareDiskSize(
 	}
 	// log.Printf("%s", clonedConfig)
 	for diskID, diskConf := range diskConfMap {
+		if diskConf["media"] == "cdrom" {
+			continue
+		}
 		diskName := fmt.Sprintf("%v%v", diskConf["type"], diskID)
 
 		diskSize := pxapi.DiskSizeGB(diskConf["size"])
@@ -1873,6 +1966,73 @@ func FlattenDevicesList(proxmoxDevices pxapi.QemuDevices) ([]map[string]interfac
 	return flattenedDevices, nil
 }
 
+func BuildSmbiosArgs(smbiosList []interface{}) string {
+	useBase64 := false
+	if len(smbiosList) == 0 {
+		return ""
+	}
+
+	smbiosArgs := []string{}
+	for _, v := range smbiosList {
+		for conf, value := range v.(map[string]interface{}) {
+			switch conf {
+
+			case "uuid":
+				var s string
+				if value.(string) == "" {
+					s = fmt.Sprintf("%s=%s", conf, uuid.New().String())
+				} else {
+					s = fmt.Sprintf("%s=%s", conf, value.(string))
+				}
+				smbiosArgs = append(smbiosArgs, s)
+
+			case "serial", "manufacturer", "product", "version", "sku", "family":
+				if value.(string) == "" {
+					continue
+				} else {
+					s := fmt.Sprintf("%s=%s", conf, base64.StdEncoding.EncodeToString([]byte(value.(string))))
+					smbiosArgs = append(smbiosArgs, s)
+					useBase64 = true
+				}
+			default:
+				continue
+			}
+		}
+	}
+	if useBase64 {
+		smbiosArgs = append(smbiosArgs, "base64=1")
+	}
+
+	return strings.Join(smbiosArgs, ",")
+}
+
+func ReadSmbiosArgs(smbios string) []interface{} {
+	if smbios == "" {
+		return nil
+	}
+
+	smbiosArgs := []interface{}{}
+	smbiosMap := make(map[string]interface{}, 0)
+	for _, l := range strings.Split(smbios, ",") {
+		if l == "" || l == "base64=1" {
+			continue
+		}
+		parsedParameter, err := url.ParseQuery(l)
+		if err != nil {
+			log.Fatal(err)
+		}
+		for k, v := range parsedParameter {
+			decodedString, err := base64.StdEncoding.DecodeString(v[0])
+			if err != nil {
+				decodedString = []byte(v[0])
+			}
+			smbiosMap[k] = string(decodedString)
+		}
+	}
+
+	return append(smbiosArgs, smbiosMap)
+}
+
 // Consumes a terraform TypeList of a Qemu Device (network, hard drive, etc) and returns the "Expanded"
 // version of the equivalent configuration that the API understands (the struct pxapi.QemuDevices).
 // NOTE this expects the provided deviceList to be []map[string]interface{}.
@@ -1930,32 +2090,45 @@ func UpdateDevicesSet(
 	return devicesSet
 }
 
-func initConnInfo(
+func initConnInfo(ctx context.Context,
 	d *schema.ResourceData,
 	pconf *providerConfiguration,
 	client *pxapi.Client,
 	vmr *pxapi.VmRef,
 	config *pxapi.ConfigQemu,
 	lock *pmApiLockHolder,
-) error {
+) diag.Diagnostics {
 
 	logger, _ := CreateSubLogger("initConnInfo")
 
 	var err error
 	var lasterr error
 	var interfaces []pxapi.AgentNetworkInterface
+	var diags diag.Diagnostics
 	// allow user to opt-out of setting the connection info for the resource
 	if !d.Get("define_connection_info").(bool) {
 		log.Printf("[INFO][initConnInfo] define_connection_info is %t, no further action", d.Get("define_connection_info").(bool))
 		logger.Info().Int("vmid", vmr.VmId()).Msgf("define_connection_info is %t, no further action", d.Get("define_connection_info").(bool))
 
-		return nil
+		diags = append(diags, diag.Diagnostic{
+			Severity:      diag.Warning,
+			Summary:       "define_connection_info is %t, no further action.",
+			Detail:        "define_connection_info is %t, no further action",
+			AttributePath: cty.Path{},
+		})
+		return diags
 	}
 	// allow user to opt-out of setting the connection info for the resource
 	if d.Get("agent") != 1 {
 		log.Printf("[INFO][initConnInfo] qemu agent is disabled from proxmox config, cant comunicate with vm.")
 		logger.Info().Int("vmid", vmr.VmId()).Msgf("qemu agent is disabled from proxmox config, cant comunicate with vm.")
-		return nil
+		diags = append(diags, diag.Diagnostic{
+			Severity:      diag.Warning,
+			Summary:       "Qemu Guest Agent support is disabled from proxmox config.",
+			Detail:        "Qemu Guest Agent support is required to make comunications with the VM",
+			AttributePath: cty.Path{},
+		})
+		return diags
 	}
 
 	log.Print("[INFO][initConnInfo] trying to get vm ip address for provisioner")
@@ -1991,7 +2164,7 @@ func initConnInfo(
 		} else if !strings.Contains(err.Error(), "500 QEMU guest agent is not running") {
 			// "not running" means either not installed or not started yet.
 			// any other error should not happen here
-			return err
+			return diag.FromErr(err)
 		}
 		// wait before next try
 		time.Sleep(time.Duration(d.Get("additional_wait").(int)) * time.Second)
@@ -1999,11 +2172,11 @@ func initConnInfo(
 	if lasterr != nil {
 		log.Printf("[INFO][initConnInfo] error from PVE: \"%s\"\n, QEMU Agent is enabled in you configuration but non installed/not working on your vm", lasterr)
 		logger.Info().Int("vmid", vmr.VmId()).Msgf("error from PVE: \"%s\"\n, QEMU Agent is enabled in you configuration but non installed/not working on your vm", lasterr)
-		return fmt.Errorf("error from PVE: \"%s\"\n, QEMU Agent is enabled in you configuration but non installed/not working on your vm", lasterr)
+		return diag.FromErr(fmt.Errorf("error from PVE: \"%s\"\n, QEMU Agent is enabled in you configuration but non installed/not working on your vm", lasterr))
 	}
 	vmConfig, err := client.GetVmConfig(vmr)
 	if err != nil {
-		return err
+		return diag.FromErr(err)
 	}
 	log.Print("[INFO][initConnInfo] trying to find IP address of first network card")
 	logger.Info().Int("vmid", vmr.VmId()).Msgf("trying to find IP address of first network card")
@@ -2055,7 +2228,7 @@ func initConnInfo(
 			if err != nil {
 				log.Printf("[DEBUG][initConnInfo] vmstate error %s", err.Error())
 				logger.Debug().Int("vmid", vmr.VmId()).Msgf("vmstate error %s", err.Error())
-				return err
+				return diag.FromErr(err)
 			}
 
 			if d.Get("ipconfig0").(string) != "ip=dhcp" || vmState["agent"] == nil || vmState["agent"].(float64) != 1 {
@@ -2069,7 +2242,7 @@ func initConnInfo(
 				log.Printf("[DEBUG][initConnInfo] ipconfig0 interfaces: %v", interfaces)
 				logger.Debug().Int("vmid", vmr.VmId()).Msgf("ipconfig0 interfaces %v", interfaces)
 				if err != nil {
-					return err
+					return diag.FromErr(err)
 				} else {
 					for _, iface := range interfaces {
 						if sshHost == ipMatch[1] {
@@ -2095,48 +2268,28 @@ func initConnInfo(
 			sshPort = sshParts[1]
 		}
 	}
-	// This code is legacy
-	// else {
-	// 	log.Print("[DEBUG] setting up SSH forward")
-	// 	if d.Get("ssh_forward_ip") != nil {
-	// 		sshHost = d.Get("ssh_forward_ip").(string)
-	// 		sshPort, err = pxapi.SshForwardUsernet(vmr, client)
-	// 		if err != nil {
-	// 			return err
-	// 		}
-	// 	}
-
-	// }
-
-	// Done with proxmox API, end parallel and do the SSH things
-	// lock.unlock()
 	if sshHost == "" {
 		log.Print("[DEBUG][initConnInfo] Cannot find any IP address")
 		logger.Debug().Int("vmid", vmr.VmId()).Msgf("Cannot find any IP address")
-		return fmt.Errorf("cannot find any IP address")
+		return diag.FromErr(fmt.Errorf("cannot find any IP address"))
 	}
 
 	log.Printf("[DEBUG][initConnInfo] this is the vm configuration: %s %s", sshHost, sshPort)
 	logger.Debug().Int("vmid", vmr.VmId()).Msgf("this is the vm configuration: %s %s", sshHost, sshPort)
 
 	// Optional convience attributes for provisioners
-	d.Set("default_ipv4_address", sshHost)
-	d.Set("ssh_host", sshHost)
-	d.Set("ssh_port", sshPort)
+	err = d.Set("default_ipv4_address", sshHost)
+	diags = append(diags, diag.FromErr(err)...)
+	err = d.Set("ssh_host", sshHost)
+	diags = append(diags, diag.FromErr(err)...)
+	err = d.Set("ssh_port", sshPort)
+	diags = append(diags, diag.FromErr(err)...)
 
 	// This connection INFO is longer shared up to the providers :-(
 	d.SetConnInfo(map[string]string{
 		"type": "ssh",
 		"host": sshHost,
 		"port": sshPort,
-		// "user":            d.Get("ssh_user").(string),
-		// "private_key":     d.Get("ssh_private_key").(string),
-		// not sure what the following stuff was for?!
-		// "pm_api_url":      client.ApiUrl,
-		// "pm_user":         client.Username,
-		// "pm_password":     client.Password,
-		// "pm_otp":          client.Otp,
-		// "pm_tls_insecure": "true", // TODO - pass pm_tls_insecure state around, but if we made it this far, default insecure
 	})
-	return nil
+	return diags
 }
