@@ -1484,6 +1484,17 @@ func resourceVmQemuUpdate(ctx context.Context, d *schema.ResourceData, meta inte
 	// enabled. Attempt a graceful shutdown or if that fails, force poweroff.
 	vmState, err := client.GetVmState(vmr)
 	if err == nil && vmState["status"] != "stopped" && d.Get("vm_state").(string) == "stopped" {
+		log.Print("[DEBUG][QemuVmUpdate] shutting down VM to match `vm_state`")
+		_, err = client.ShutdownVm(vmr)
+		// note: the default timeout is 3 min, configurable per VM: Options/Start-Shutdown Order/Shutdown timeout
+		if err != nil {
+			log.Print("[DEBUG][QemuVmUpdate] shutdown failed, stopping VM forcefully")
+			_, err = client.StopVm(vmr)
+			if err != nil {
+				return diag.FromErr(err)
+			}
+		}
+	} else if err == nil && vmState["status"] != "stopped" && d.Get("reboot_required").(bool) {
 		if d.Get("automatic_reboot").(bool) {
 			log.Print("[DEBUG][QemuVmUpdate] rebooting the VM to match `vm_state`")
 			if _, err := client.RebootVm(vmr); err != nil {
@@ -1499,19 +1510,6 @@ func resourceVmQemuUpdate(ctx context.Context, d *schema.ResourceData, meta inte
 				time.Sleep(dur)
 
 				if _, err := client.StartVm(vmr); err != nil {
-					return diag.FromErr(err)
-				}
-			}
-		}
-	} else if err == nil && vmState["status"] != "stopped" && d.Get("reboot_required").(bool) {
-		if d.Get("automatic_reboot").(bool) {
-			log.Print("[DEBUG][QemuVmUpdate] shutting down VM for required reboot")
-			_, err = client.ShutdownVm(vmr)
-			// note: the default timeout is 3 min, configurable per VM: Options/Start-Shutdown Order/Shutdown timeout
-			if err != nil {
-				log.Print("[DEBUG][QemuVmUpdate] shutdown failed, stopping VM forcefully")
-				_, err = client.StopVm(vmr)
-				if err != nil {
 					return diag.FromErr(err)
 				}
 			}
