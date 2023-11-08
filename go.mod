@@ -5,13 +5,12 @@ go 1.18
 require (
 	github.com/hashicorp/go-cty v1.4.1-0.20200414143053-d3edf31b6320
 	github.com/hashicorp/terraform-plugin-sdk/v2 v2.26.1
-	github.com/lucian-tx/proxmox-api-go v0.0.2
+	github.com/lucian-tx/proxmox-api-go v0.0.3
 	github.com/rs/zerolog v1.29.1
 
 )
 
 require (
-	github.com/Telmate/proxmox-api-go v0.0.0-20230616173359-03f4e428f6c6 // indirect
 	github.com/agext/levenshtein v1.2.3 // indirect
 	github.com/apparentlymart/go-textseg/v13 v13.0.0 // indirect
 	github.com/fatih/color v1.15.0 // indirect
@@ -43,7 +42,6 @@ require (
 	github.com/mitchellh/mapstructure v1.5.0 // indirect
 	github.com/mitchellh/reflectwalk v1.0.2 // indirect
 	github.com/oklog/run v1.1.0 // indirect
-	github.com/stretchr/testify v1.8.2 // indirect
 	github.com/vmihailenco/msgpack v4.0.4+incompatible // indirect
 	github.com/vmihailenco/msgpack/v5 v5.3.5 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect

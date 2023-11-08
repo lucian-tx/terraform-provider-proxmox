@@ -856,18 +856,29 @@ func resourceVmQemuCreate(d *schema.ResourceData, meta interface{}) error {
 	qemuUsbs, _ := ExpandDevicesList(d.Get("usb").([]interface{}))
 
 	config := pxapi.ConfigQemu{
-		Name:           vmName,
-		Description:    d.Get("desc").(string),
-		Pool:           d.Get("pool").(string),
-		Bios:           d.Get("bios").(string),
-		Onboot:         BoolPointer(d.Get("onboot").(bool)),
-		Startup:        d.Get("startup").(string),
-		Tablet:         BoolPointer(d.Get("tablet").(bool)),
-		Boot:           d.Get("boot").(string),
-		BootDisk:       d.Get("bootdisk").(string),
-		Agent:          d.Get("agent").(int),
-		Memory:         d.Get("memory").(int),
-		Machine:        d.Get("machine").(string),
+		Name:        vmName,
+		Description: d.Get("desc").(string),
+		Pool:        d.Get("pool").(string),
+		Bios:        d.Get("bios").(string),
+		Onboot:      BoolPointer(d.Get("onboot").(bool)),
+		Startup:     d.Get("startup").(string),
+		Tablet:      BoolPointer(d.Get("tablet").(bool)),
+		Boot:        d.Get("boot").(string),
+		BootDisk:    d.Get("bootdisk").(string),
+		Agent:       d.Get("agent").(int),
+		Memory:      d.Get("memory").(int),
+		Machine:     d.Get("machine").(string),
+		RunningMachine: func() string {
+			v := d.Get("running-machine")
+			if v == nil {
+				return ""
+			}
+			out, ok := v.(string)
+			if !ok {
+				return ""
+			}
+			return out
+		}(),
 		Balloon:        d.Get("balloon").(int),
 		QemuCores:      d.Get("cores").(int),
 		QemuSockets:    d.Get("sockets").(int),
@@ -1168,18 +1179,29 @@ func resourceVmQemuUpdate(ctx context.Context, d *schema.ResourceData, meta inte
 	d.Partial(false)
 
 	config := pxapi.ConfigQemu{
-		Name:           d.Get("name").(string),
-		Description:    d.Get("desc").(string),
-		Pool:           d.Get("pool").(string),
-		Bios:           d.Get("bios").(string),
-		Onboot:         BoolPointer(d.Get("onboot").(bool)),
-		Startup:        d.Get("startup").(string),
-		Tablet:         BoolPointer(d.Get("tablet").(bool)),
-		Boot:           d.Get("boot").(string),
-		BootDisk:       d.Get("bootdisk").(string),
-		Agent:          d.Get("agent").(int),
-		Memory:         d.Get("memory").(int),
-		Machine:        d.Get("machine").(string),
+		Name:        d.Get("name").(string),
+		Description: d.Get("desc").(string),
+		Pool:        d.Get("pool").(string),
+		Bios:        d.Get("bios").(string),
+		Onboot:      BoolPointer(d.Get("onboot").(bool)),
+		Startup:     d.Get("startup").(string),
+		Tablet:      BoolPointer(d.Get("tablet").(bool)),
+		Boot:        d.Get("boot").(string),
+		BootDisk:    d.Get("bootdisk").(string),
+		Agent:       d.Get("agent").(int),
+		Memory:      d.Get("memory").(int),
+		Machine:     d.Get("machine").(string),
+		RunningMachine: func() string {
+			v := d.Get("running-machine")
+			if v == nil {
+				return ""
+			}
+			out, ok := v.(string)
+			if !ok {
+				return ""
+			}
+			return out
+		}(),
 		Balloon:        d.Get("balloon").(int),
 		QemuCores:      d.Get("cores").(int),
 		QemuSockets:    d.Get("sockets").(int),
@@ -1239,7 +1261,9 @@ func resourceVmQemuUpdate(ctx context.Context, d *schema.ResourceData, meta inte
 	// give sometime to proxmox to catchup
 	time.Sleep(time.Duration(d.Get("additional_wait").(int)) * time.Second)
 
-	prepareDiskSize(client, vmr, qemuDisks, d)
+	if err := prepareDiskSize(client, vmr, qemuDisks, d); err != nil {
+		log.Printf("[ERROR][QemuVmUpdate] error while preparing disk size: %v", err)
+	}
 
 	// give sometime to proxmox to catchup
 	time.Sleep(time.Duration(d.Get("additional_wait").(int)) * time.Second)
