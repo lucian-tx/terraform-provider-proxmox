@@ -1396,24 +1396,21 @@ func resourceVmQemuUpdate(ctx context.Context, d *schema.ResourceData, meta inte
 	if err == nil && vmState["status"] != "stopped" && d.Get("reboot_required").(bool) {
 		if d.Get("automatic_reboot").(bool) {
 			log.Print("[DEBUG][QemuVmUpdate] rebooting the VM to match the configuration changes")
-			_, err = client.RebootVm(vmr)
+
 			// note: the default timeout is 3 min, configurable per VM: Options/Start-Shutdown Order/Shutdown timeout
-			if err != nil {
-				log.Print("[DEBUG][QemuVmUpdate] reboot failed, stopping VM forcefully")
-
-				if _, err := client.StopVm(vmr); err != nil {
-					return diag.FromErr(err)
-				}
-
-				// give sometime to proxmox to catchup
-				dur := time.Duration(d.Get("additional_wait").(int)) * time.Second
-				log.Printf("[DEBUG][QemuVmUpdate] waiting for (%v) before starting the VM again", dur)
-				time.Sleep(dur)
-
-				if _, err := client.StartVm(vmr); err != nil {
-					return diag.FromErr(err)
-				}
+			if _, err := client.StopVm(vmr); err != nil {
+				return diag.FromErr(err)
 			}
+
+			// give sometime to proxmox to catchup
+			dur := time.Duration(d.Get("additional_wait").(int)) * time.Second
+			log.Printf("[DEBUG][QemuVmUpdate] waiting for (%v) before starting the VM again", dur)
+			time.Sleep(dur)
+
+			if _, err := client.StartVm(vmr); err != nil {
+				return diag.FromErr(err)
+			}
+
 		} else {
 			// Automatic reboots is not enabled, show the user a warning message that
 			// the VM needs a reboot for the changed parameters to take in effect.
