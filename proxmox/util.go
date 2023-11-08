@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	pxapi "github.com/Telmate/proxmox-api-go/proxmox"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	pxapi "github.com/lucian-tx/proxmox-api-go/proxmox"
 	"github.com/rs/zerolog"
 )
 
@@ -160,7 +160,7 @@ func ConfigureLogger(enableOutput bool, logPath string, inputLogLevels map[strin
 		log.SetOutput(f) // so we capture logs from any other dependencies not using logrus
 	}
 
-	//create channel to control exit | will block until all copies are finished
+	// create channel to control exit | will block until all copies are finished
 	communicateLogExit := make(chan bool)
 
 	go func() {
@@ -180,14 +180,14 @@ func ConfigureLogger(enableOutput bool, logPath string, inputLogLevels map[strin
 	// yep this is a huge leak.. need to figure out a better way to close stuff down,
 	// but for now, yolo!  we're just debugging.
 	//
-	//// function to be deferred in main until program exits
-	//return func() {
+	// // function to be deferred in main until program exits
+	// return func() {
 	//	// close writer then block on exit channel | this will let mw finish writing before the program exits
 	//	_ = w.Close()
 	//	<-communicateLogExit
 	//	// close file after all writes have finished
 	//	_ = f.Close()
-	//}
+	// }
 
 	rootLogger.Info().Msgf("Logging Started. Root Logger Set to level %v", rootLevel)
 }

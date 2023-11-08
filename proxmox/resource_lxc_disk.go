@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strings"
 
-	pxapi "github.com/Telmate/proxmox-api-go/proxmox"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	pxapi "github.com/lucian-tx/proxmox-api-go/proxmox"
 )
 
 func resourceLxcDisk() *schema.Resource {
