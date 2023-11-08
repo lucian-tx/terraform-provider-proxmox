@@ -1096,12 +1096,12 @@ func resourceVmQemuCreate(d *schema.ResourceData, meta interface{}) error {
 			return err
 		}
 		// give sometime to proxmox to catchup
-		time.Sleep(time.Duration(d.Get("additional_wait").(int)) * time.Second)
+		// time.Sleep(time.Duration(d.Get("additional_wait").(int)) * time.Second)
 
-		err = initConnInfo(d, pconf, client, vmr, &config, lock)
-		if err != nil {
-			return err
-		}
+		// err = initConnInfo(d, pconf, client, vmr, &config, lock)
+		// if err != nil {
+		// 	return err
+		// }
 	} else {
 		log.Print("[DEBUG][QemuVmCreate] oncreate = false, not starting VM")
 	}
