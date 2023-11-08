@@ -15,10 +15,10 @@ var lxcResourceDef *schema.Resource
 
 func resourceLxc() *schema.Resource {
 	lxcResourceDef = &schema.Resource{
-		Create: resourceLxcCreate,
-		Read:   resourceLxcRead,
-		Update: resourceLxcUpdate,
-		Delete: resourceVmQemuDelete,
+		Create:        resourceLxcCreate,
+		Read:          resourceLxcRead,
+		Update:        resourceLxcUpdate,
+		DeleteContext: resourceVmQemuDelete,
 		Importer: &schema.ResourceImporter{
 			StateContext: schema.ImportStatePassthroughContext,
 		},
