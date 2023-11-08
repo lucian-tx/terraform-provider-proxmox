@@ -1398,8 +1398,11 @@ func resourceVmQemuUpdate(ctx context.Context, d *schema.ResourceData, meta inte
 			log.Print("[DEBUG][QemuVmUpdate] rebooting the VM to match the configuration changes")
 
 			// note: the default timeout is 3 min, configurable per VM: Options/Start-Shutdown Order/Shutdown timeout
-			if _, err := client.StopVm(vmr); err != nil {
-				return diag.FromErr(err)
+			if _, err := client.ShutdownVm(vmr); err != nil {
+				log.Printf("[DEBUG][QemuVmUpdate] failed to shutdown the VM, trying to force poweroff: %v", err)
+				if _, err := client.StopVm(vmr); err != nil {
+					return diag.FromErr(err)
+				}
 			}
 
 			// give sometime to proxmox to catchup
